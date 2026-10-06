@@ -38,6 +38,23 @@ class PublishRequest(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class ReorderSegment(BaseModel):
+    """段落编排清单项：source_position 与 text 二选一。
+
+    - source_position：引用"调整前"的旧段位置，该段原文版本 / 译文 /
+      确认状态整体跟随到新位置；
+    - text：在此位置插入一段新原文（新版本从 1 起，且没有译文）。
+    """
+
+    source_position: int | None = Field(default=None, ge=0)
+    text: str | None = Field(default=None, min_length=1)
+
+
+class ReorderDraftRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    segments: list[ReorderSegment] = Field(min_length=1)
+
+
 class TranslationView(BaseModel):
     source_version: int
     target_text: str
