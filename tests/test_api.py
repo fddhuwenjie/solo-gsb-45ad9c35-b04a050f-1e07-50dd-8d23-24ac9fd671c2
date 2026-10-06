@@ -66,6 +66,21 @@ def _publish(client, mid, rev):
     )
 
 
+def _reorder(client, mid, expected_revision, items):
+    return client.post(
+        f"/manuscripts/{mid}/reorder",
+        json={"expected_revision": expected_revision, "segments": items},
+    )
+
+
+def _ref(pos):
+    return {"source_position": pos}
+
+
+def _new(text):
+    return {"source_text": text}
+
+
 # ---- 基本流程 -------------------------------------------------------------
 
 
@@ -376,6 +391,258 @@ def test_stress_concurrent_rewrite_publish_snapshots_consistent(client):
         ).json()
         assert again == pub
 
+
+
+# ---- 段落编排 -------------------------------------------------------------
+
+
+def test_reorder_reverse_and_revise_revision_once(client):
+    mid = _create(client, 3)
+    for i in range(3):
+        _submit(client, mid, i, f"t{i}", 1)
+        _confirm(client, mid, i, 1)
+
+    # 逆序排列：保留段的版本 / 译文 / 确认状态跟随原段
+    r = _reorder(client, mid, 1, [_ref(2), _ref(1), _ref(0)])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["revision"] == 2
+    assert body["segment_count"] == 3
+
+    draft = client.get(f"/manuscripts/{mid}/draft").json()
+    assert draft["revision"] == 2
+    assert [s["source_text"] for s in draft["segments"]] == ["原文2", "原文1", "原文0"]
+    assert [s["position"] for s in draft["segments"]] == [0, 1, 2]
+    assert all(s["source_version"] == 1 for s in draft["segments"])
+    assert all(s["status"] == "confirmed" for s in draft["segments"])
+    assert [s["translation"]["target_text"] for s in draft["segments"]] == [
+        "t2", "t1", "t0",
+    ]
+
+    # 位置改写接口按新位置工作：改的是"新位置 0"=旧位置 2 的段
+    r = client.put(
+        f"/manuscripts/{mid}/segments/0/source",
+        json={"text": "原文2-改", "expected_revision": 2},
+    )
+    assert r.status_code == 200
+    assert r.json()["source_version"] == 2
+    assert r.json()["revision"] == 3
+
+
+def test_reorder_drop_and_insert_segments(client):
+    mid = _create(client, 3)
+    _submit(client, mid, 0, "t0", 1)
+    _confirm(client, mid, 0, 1)
+    _submit(client, mid, 1, "t1", 1)
+    _confirm(client, mid, 1, 1)
+    _submit(client, mid, 2, "t2", 1)
+    _confirm(client, mid, 2, 1)
+
+    # 新顺序：[新段, 旧2, 旧0] —— 旧1 被删除；新段版本 1、无译文
+    r = _reorder(client, mid, 1, [_new("全新原文"), _ref(2), _ref(0)])
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "manuscript_id": mid, "revision": 2, "segment_count": 3,
+    }
+
+    draft = client.get(f"/manuscripts/{mid}/draft").json()
+    by_pos = {s["position"]: s for s in draft["segments"]}
+    assert by_pos[0]["source_text"] == "全新原文"
+    assert by_pos[0]["source_version"] == 1
+    assert by_pos[0]["status"] == "missing"
+    assert by_pos[0]["translation"] is None
+    assert by_pos[0]["stale_translation"] is None
+    assert by_pos[1]["source_text"] == "原文2"
+    assert by_pos[1]["status"] == "confirmed"
+    assert by_pos[1]["translation"]["target_text"] == "t2"
+    assert by_pos[2]["source_text"] == "原文0"
+    assert by_pos[2]["translation"]["target_text"] == "t0"
+
+    # 被删除的旧段彻底不存在：新位置越界与旧位置都不可访问
+    assert client.put(
+        f"/manuscripts/{mid}/segments/3/source",
+        json={"text": "x", "expected_revision": 2},
+    ).status_code == 404
+
+    # 新段译文从版本 1 起步
+    assert _submit(client, mid, 0, "new-t", 1).status_code == 200
+    assert _confirm(client, mid, 0, 1).status_code == 200
+
+
+def test_reorder_can_shrink_to_one_segment(client):
+    mid = _create(client, 3)
+    r = _reorder(client, mid, 1, [_ref(2)])
+    assert r.status_code == 200, r.text
+    draft = client.get(f"/manuscripts/{mid}/draft").json()
+    assert [s["source_text"] for s in draft["segments"]] == ["原文2"]
+    assert draft["revision"] == 2
+
+    # 稿件元数据的段计数同步
+    meta = client.get(f"/manuscripts/{mid}").json()
+    assert meta["segment_count"] == 1
+    assert meta["revision"] == 2
+
+
+def test_reorder_revision_conflict_is_full_rollback(client):
+    mid = _create(client, 3)
+    r = _reorder(client, mid, 99, [_ref(0)])
+    assert r.status_code == 409
+
+    # 过期拒绝不留任何改动
+    draft = client.get(f"/manuscripts/{mid}/draft").json()
+    assert draft["revision"] == 1
+    assert [s["source_text"] for s in draft["segments"]] == ["原文0", "原文1", "原文2"]
+
+
+def test_reorder_invalid_lists_rejected_entirely(client):
+    mid = _create(client, 2)
+
+    def rejected(items, status_code=422):
+        before = client.get(f"/manuscripts/{mid}/draft").json()
+        r = _reorder(client, mid, 1, items)
+        assert r.status_code == status_code, r.text
+        after = client.get(f"/manuscripts/{mid}/draft").json()
+        assert before == after  # 整次拒绝，无部分改动
+
+    # 旧段越界
+    rejected([_ref(0), _ref(5)])
+    # 旧段重复引用
+    rejected([_ref(0), _ref(0)])
+    # 新段空白文本
+    rejected([_new("   "), _ref(0)])
+    # 一个旧段都不保留（全新清单）
+    rejected([_new("全新A"), _new("全新B")])
+    # 空清单
+    rejected([])
+    # 一项同时给了两个引用
+    rejected([{"source_position": 0, "source_text": "x"}])
+    # 一项两个引用都不给
+    rejected([{}])
+    # expected_revision 非法
+    r = _reorder(client, mid, 0, [_ref(0)])
+    assert r.status_code == 422
+
+    # 各种拒绝后修订号与段落原样不动
+    assert client.get(f"/manuscripts/{mid}").json()["revision"] == 1
+
+
+def test_reorder_new_unconfirmed_segment_blocks_publish(client):
+    mid = _create(client, 2)
+    for i in range(2):
+        _submit(client, mid, i, f"t{i}", 1)
+        _confirm(client, mid, i, 1)
+
+    # 先发布一版"调整前"的定版
+    r = _publish(client, mid, 1)
+    assert r.status_code == 201
+    assert r.json()["edition"] == 1
+
+    # 编排：两段保留段都已确认，但插入的新段没有译文
+    r = _reorder(client, mid, 1, [_ref(0), _new("新增段"), _ref(1)])
+    assert r.status_code == 200
+
+    # 用旧修订号发布 -> 409
+    assert _publish(client, mid, 1).status_code == 409
+    # 新修订号 -> 422，只有新段是阻塞段
+    r = _publish(client, mid, 2)
+    assert r.status_code == 422
+    assert r.json()["detail"]["blocking_segments"] == [
+        {"position": 1, "source_version": 1},
+    ]
+    # 失败不增加版号
+    editions = client.get(f"/manuscripts/{mid}/publications").json()
+    assert [p["edition"] for p in editions] == [1]
+
+    # 补齐新段译文并确认后可发布"调整后"的整篇
+    _submit(client, mid, 1, "t-new", 1)
+    _confirm(client, mid, 1, 1)
+    r = _publish(client, mid, 2)
+    assert r.status_code == 201, r.text
+    pub2 = r.json()
+    assert pub2["edition"] == 2
+    assert pub2["revision"] == 2
+    assert [s["source_text"] for s in pub2["segments"]] == ["原文0", "新增段", "原文1"]
+
+    # 旧定版仍按调整前的原样读取
+    old = client.get(f"/manuscripts/{mid}/publications/1").json()
+    assert old["revision"] == 1
+    assert [s["source_text"] for s in old["segments"]] == ["原文0", "原文1"]
+    assert [s["target_text"] for s in old["segments"]] == ["t0", "t1"]
+
+
+def test_reorder_carries_stale_state_and_translations(client):
+    mid = _create(client, 2)
+    _submit(client, mid, 0, "t0", 1)
+    _confirm(client, mid, 0, 1)
+    _submit(client, mid, 1, "t1", 1)
+    _confirm(client, mid, 1, 1)
+
+    # 第 0 段改版：已确认译文失效待复核
+    client.put(
+        f"/manuscripts/{mid}/segments/0/source",
+        json={"text": "原文0-v2", "expected_revision": 1},
+    )
+
+    # 交换顺序：stale 状态、译文历史全部随段移动
+    r = _reorder(client, mid, 2, [_ref(1), _ref(0)])
+    assert r.status_code == 200, r.text
+    assert r.json()["revision"] == 3
+
+    draft = client.get(f"/manuscripts/{mid}/draft").json()
+    assert draft["segments"][0]["source_text"] == "原文1"
+    assert draft["segments"][0]["status"] == "confirmed"
+    assert draft["segments"][1]["source_text"] == "原文0-v2"
+    assert draft["segments"][1]["source_version"] == 2
+    assert draft["segments"][1]["status"] == "stale"
+    assert draft["segments"][1]["stale_translation"]["target_text"] == "t0"
+
+    # 新位置 1 上必须依据当前版本 2 提交 / 确认，旧版本 1 被拒
+    assert _submit(client, mid, 1, "x", 1).status_code == 409
+    assert _submit(client, mid, 1, "t0-v2", 2).status_code == 200
+    assert _confirm(client, mid, 1, 2).status_code == 200
+
+
+def test_concurrent_reorder_and_publish_never_mix_layouts(client):
+    """编排与发布交错：成功定版只能是调整前或调整后的完整一整篇。"""
+    mid = _create(client, 2)
+    for i in range(2):
+        _submit(client, mid, i, f"t{i}", 1)
+        _confirm(client, mid, i, 1)
+
+    barrier = threading.Barrier(2)
+
+    def reorder():
+        barrier.wait()
+        r = _reorder(client, mid, 1, [_ref(1), _new("新增")])
+        return r.status_code
+
+    def publish():
+        barrier.wait()
+        r = _publish(client, mid, 1)
+        return r.status_code, r.json() if r.status_code == 201 else None
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        ro_code, pb = list(ex.map(lambda f: f(), [reorder, publish]))
+        _, pb_body = pb
+
+    pubs = client.get(f"/manuscripts/{mid}/publications").json()
+    if pb[0] == 201:
+        # 发布抢锁成功 -> 定格调整前 rev1 的两段
+        assert pb_body["revision"] == 1
+        assert [s["source_text"] for s in pb_body["segments"]] == ["原文0", "原文1"]
+        assert len(pubs) == 1
+        # 编排随后仍成功（发布不推进修订号）
+        assert ro_code == 200
+    else:
+        # 编排先提交 -> 发布依据过期修订号 409
+        assert pb[0] == 409
+        assert ro_code == 200
+        assert pubs == []
+
+    # 无论谁先，工作稿最终都是调整后的完整状态（rev2：旧1、新增）
+    draft = client.get(f"/manuscripts/{mid}/draft").json()
+    assert draft["revision"] == 2
+    assert [s["source_text"] for s in draft["segments"]] == ["原文1", "新增"]
 
 
 def test_validation_errors(client):

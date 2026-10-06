@@ -1,12 +1,18 @@
 """双语文稿定版 HTTP API。
 
 核心不变量：
-  * 工作稿修订号 revision 只在原文段内容真正改变时 +1（全文共享一个号）。
+  * 工作稿修订号 revision 只在原文真正改变时 +1（全文共享一个号）：
+    原文按段改写 +1；段落编排（重排 / 删除 / 新增）整次提交也只 +1。
   * 译文必须注明所依据的原文版本；依据过期版本的提交 / 确认一律 409 拒绝。
   * 原文改版只影响对应段：该段已确认译文翻转为 stale（待复核），其他段不动。
+  * 段落编排一次提交原子调整整篇顺序：成功后位置从 0 连续重排；保留段携带
+    自己的原文版本、译文与确认状态移动；未列出的旧段连同其历史一并删除；
+    新段从原文版本 1 开始且尚无译文。修订号过期或清单无效时整次拒绝，不留
+    部分改动。
   * 发布必须携带 expected_revision，且每段都有匹配"当前原文版本"的
     已确认译文，否则要么 409 修订冲突，要么 422 返回阻塞段，且不增加版号。
-  * 定版以整篇 JSON 快照落库，按版号读取永不随后续修改 / 复核变化。
+  * 定版以整篇 JSON 快照落库，按版号读取永不随后续修改 / 复核 / 编排变化；
+    编排与发布通过写锁互斥，定版只能定格调整前或调整后的完整一整篇。
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from .schemas import (
     DraftView,
     PublicationView,
     PublishRequest,
+    ReorderSegments,
     RewriteSource,
     SEGMENT_MISSING,
     SEGMENT_STALE,
@@ -301,6 +308,137 @@ def rewrite_source(
         "source_version": new_version,
         "revision": new_revision,
         "changed": True,
+    }
+
+
+# ---- 段落编排 -------------------------------------------------------------
+
+
+@app.post("/manuscripts/{manuscript_id}/reorder")
+def reorder_segments(
+    manuscript_id: int,
+    payload: ReorderSegments,
+    conn: sqlite3.Connection = Depends(db.get_conn),
+) -> dict:
+    """一次提交重排整篇工作稿的段落顺序（原子操作）。
+
+    清单项二选一：
+      * {"source_position": k} —— 引用调整前位置 k 的旧段（不可重复引用）；
+      * {"source_text": "..."} —— 在此插入一段新原文（版本 1，尚无译文）。
+
+    成功后：
+      * 新位置从 0 连续编号；保留段的原文版本、译文与确认状态随段移动；
+      * 未被列出的旧段（连同其译文与原文版本历史）从工作稿移除；
+      * 新段从原文版本 1 开始，状态 missing；
+      * 工作稿修订号只增加一次。
+
+    expected_revision 过期 -> 409；清单无效（旧段越界 / 重复引用 / 新段为
+    空白文本 / 一个旧段都没保留）-> 422。任何失败都在同一立即写事务内
+    回滚，不留部分改动；与发布互斥，定版不会跨编排拼装。
+    """
+    with db.write_tx(conn):
+        m = _get_manuscript(conn, manuscript_id)
+        if m["revision"] != payload.expected_revision:
+            raise _conflict(
+                f"修订冲突：工作稿当前修订号为 {m['revision']}，"
+                f"编排请求依据的是 {payload.expected_revision}"
+            )
+
+        old_segments = conn.execute(
+            "SELECT id, position, source_version, source_text "
+            "FROM segments WHERE manuscript_id = ? ORDER BY position",
+            (manuscript_id,),
+        ).fetchall()
+        old_by_position = {seg["position"]: seg for seg in old_segments}
+
+        referenced: set[int] = set()
+        for index, item in enumerate(payload.segments):
+            if item.source_position is not None:
+                old_pos = item.source_position
+                if old_pos not in old_by_position:
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "reason": "invalid_reorder",
+                            "message": f"清单项 {index} 引用的调整前位置 {old_pos} 不存在",
+                            "index": index,
+                        },
+                    )
+                if old_pos in referenced:
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "reason": "invalid_reorder",
+                            "message": f"调整前位置 {old_pos} 被重复引用",
+                            "index": index,
+                        },
+                    )
+                referenced.add(old_pos)
+            else:
+                # 字段层 min_length=1 只挡空串，纯空白在此补一道校验
+                assert item.source_text is not None
+                if not item.source_text.strip():
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "reason": "invalid_reorder",
+                            "message": f"清单项 {index} 的新原文为空白",
+                            "index": index,
+                        },
+                    )
+
+        # 1) 删除未列出的旧段：先删译文与原文版本历史，再删段本身。
+        removed = [seg for pos, seg in old_by_position.items() if pos not in referenced]
+        if removed:
+            removed_ids = [seg["id"] for seg in removed]
+            placeholders = ",".join("?" for _ in removed_ids)
+            conn.execute(
+                f"DELETE FROM translations WHERE segment_id IN ({placeholders})",
+                removed_ids,
+            )
+            conn.execute(
+                f"DELETE FROM source_revisions WHERE segment_id IN ({placeholders})",
+                removed_ids,
+            )
+            conn.execute(
+                f"DELETE FROM segments WHERE id IN ({placeholders})",
+                removed_ids,
+            )
+
+        # 2) 保留段移动到新位置（其原文版本、译文、确认状态原样跟随）。
+        for new_position, item in enumerate(payload.segments):
+            if item.source_position is not None:
+                seg = old_by_position[item.source_position]
+                conn.execute(
+                    "UPDATE segments SET position = ? WHERE id = ?",
+                    (new_position, seg["id"]),
+                )
+
+        # 3) 插入新段：当前原文版本 1，同时写入版本历史；无任何译文。
+        for new_position, item in enumerate(payload.segments):
+            if item.source_text is not None:
+                seg_cur = conn.execute(
+                    "INSERT INTO segments (manuscript_id, position, source_version, source_text) "
+                    "VALUES (?, ?, 1, ?)",
+                    (manuscript_id, new_position, item.source_text),
+                )
+                conn.execute(
+                    "INSERT INTO source_revisions (segment_id, version, source_text) "
+                    "VALUES (?, 1, ?)",
+                    (seg_cur.lastrowid, item.source_text),
+                )
+
+        # 整次编排只推进一次工作稿修订号。
+        conn.execute(
+            "UPDATE manuscripts SET revision = revision + 1 WHERE id = ?",
+            (manuscript_id,),
+        )
+        new_revision = m["revision"] + 1
+
+    return {
+        "manuscript_id": manuscript_id,
+        "revision": new_revision,
+        "segment_count": len(payload.segments),
     }
 
 
